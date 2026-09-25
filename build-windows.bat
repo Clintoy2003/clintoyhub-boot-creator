@@ -1,22 +1,26 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 
-echo Installing dependencies...
-py -m pip install --upgrade pip
-py -m pip install -r requirements.txt
-py -m pip install pyinstaller
+where python >nul 2>&1
+if errorlevel 1 (
+  echo Python was not found. Install Python and enable Add Python to PATH.
+  pause
+  exit /b 1
+)
 
-echo Building CLINTOY HUB Boot Creator...
-pyinstaller ^
-  --noconfirm ^
-  --clean ^
-  --onefile ^
-  --windowed ^
-  --name "CLINTOY-HUB-Boot-Creator" ^
-  app.py
+python -m pip install --upgrade pip
+if errorlevel 1 exit /b 1
+python -m pip install -r requirements.txt
+if errorlevel 1 exit /b 1
+python -m pip install --upgrade pyinstaller
+if errorlevel 1 exit /b 1
 
-echo.
-echo Build complete.
-echo Executable:
-echo dist\CLINTOY-HUB-Boot-Creator.exe
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name "CLINTOY-HUB-Boot-Creator" app.py
+if errorlevel 1 (
+  echo BUILD FAILED.
+  pause
+  exit /b 1
+)
+
+echo BUILD COMPLETE: dist\CLINTOY-HUB-Boot-Creator.exe
 pause
