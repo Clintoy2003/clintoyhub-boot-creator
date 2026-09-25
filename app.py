@@ -1,66 +1,55 @@
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
-    QApplication,
-    QFileDialog,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QProgressBar,
-    QVBoxLayout,
-    QWidget,
+    QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QPushButton, QProgressBar, QVBoxLayout, QWidget
 )
 
 APP_NAME = "CLINTOY HUB Boot Creator"
+MAX_FAT32_FILE = 4 * 1024**3
 
 
-def run_command(command, input_text=None):
-    return subprocess.run(
-        command,
-        input=input_text,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+def command(args, input_text=None):
+    return subprocess.run(args, input=input_text, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace")
 
 
-def is_admin():
-    if platform.system() == "Windows":
-        import ctypes
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    return hasattr(os, "geteuid") and os.geteuid() == 0
+def ps(script):
+    return command(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
 
 
-def format_bytes(value):
-    value = int(value or 0)
+def admin():
+    import ctypes
+    return bool(ctypes.windll.shell32.IsUserAnAdmin()) if platform.system() == "Windows" else False
+
+
+def quote_ps(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def human(value):
+    value = float(value or 0)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1024 or unit == "TB":
             return f"{value:.1f} {unit}"
         value /= 1024
-    return "Unknown"
+    return "0 B"
 
 
-def detect_windows_usb_drives():
-    command = [
-        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-        "Get-Disk | Where-Object {$_.BusType -eq 'USB'} | "
-        "Select-Object Number,FriendlyName,Size | ConvertTo-Json -Compress",
-    ]
-    result = run_command(command)
-    if result.returncode != 0 or not result.stdout.strip():
+def drives():
+    result = ps("Get-Disk | Where-Object {$_.BusType -eq 'USB'} | "
+                "Select-Object Number,FriendlyName,Size,IsReadOnly,OperationalStatus | "
+                "ConvertTo-Json -Compress")
+    if result.returncode or not result.stdout.strip():
         return []
     try:
         data = json.loads(result.stdout)
@@ -68,115 +57,127 @@ def detect_windows_usb_drives():
         return []
     if isinstance(data, dict):
         data = [data]
-    return [
-        {
-            "number": int(d["Number"]),
-            "name": d.get("FriendlyName") or "USB drive",
-            "size": int(d.get("Size") or 0),
-            "path": f"PhysicalDrive{int(d['Number'])}",
-        }
-        for d in data if d.get("Number") is not None
-    ]
+    return [{"number": int(x["Number"]), "name": x.get("FriendlyName") or "USB drive",
+             "size": int(x.get("Size") or 0), "readonly": bool(x.get("IsReadOnly"))}
+            for x in data if x.get("Number") is not None]
 
 
-def detect_drives():
-    return detect_windows_usb_drives() if platform.system() == "Windows" else []
-
-
-def get_drive_letter(drive_number):
-    command = [
-        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-        f"(Get-Partition -DiskNumber {drive_number} | Where-Object {{$_.DriveLetter}} | Select-Object -First 1 -ExpandProperty DriveLetter)",
-    ]
-    result = run_command(command)
+def drive_letter(number):
+    result = ps(f"(Get-Partition -DiskNumber {number} | Where-Object {{$_.DriveLetter}} | "
+                "Select-Object -First 1 -ExpandProperty DriveLetter)")
     letter = result.stdout.strip()
-    if not letter:
+    if result.returncode or not letter:
         raise RuntimeError("Windows did not assign a drive letter to the USB.")
-    return f"{letter}:"
+    return letter.upper() + ":"
 
 
-def create_partitioned_usb(drive_number):
-    script = (
-        f"select disk {drive_number}\n"
-        "attributes disk clear readonly\n"
-        "clean\n"
-        "convert gpt\n"
-        "create partition primary\n"
-        "format fs=fat32 quick label=CLINTOYUSB\n"
-        "assign\n"
-        "exit\n"
-    )
-    result = run_command(["diskpart"], script)
-    if result.returncode != 0 or "DiskPart successfully" not in result.stdout:
+def prepare_disk(number, scheme, filesystem):
+    lines = [f"select disk {number}", "attributes disk clear readonly", "clean"]
+    if scheme == "GPT":
+        lines.append("convert gpt")
+    else:
+        lines += ["convert mbr"]
+    lines += ["create partition primary"]
+    if scheme == "MBR":
+        lines.append("active")
+    lines += [f"format fs={filesystem.lower()} quick label=CLINTOYUSB", "assign", "exit"]
+    result = command(["diskpart.exe"], "\n".join(lines) + "\n")
+    if result.returncode != 0 or "error" in result.stdout.lower():
         raise RuntimeError(result.stderr or result.stdout or "DiskPart failed.")
-    return get_drive_letter(drive_number)
+    # Give Windows a moment to mount the newly-created volume.
+    for _ in range(20):
+        try:
+            return drive_letter(number)
+        except RuntimeError:
+            threading.Event().wait(0.5)
+    raise RuntimeError("The USB partition was created but no drive letter appeared.")
 
 
-def mount_iso(iso_path):
-    command = [
-        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-        f"Mount-DiskImage -ImagePath '{iso_path}' -PassThru | Get-Volume | Select-Object -First 1 -ExpandProperty DriveLetter",
-    ]
-    result = run_command(command)
+def mount_iso(path):
+    result = ps(f"$i=Mount-DiskImage -ImagePath {quote_ps(path)} -PassThru; "
+                "$i | Get-Volume | Select-Object -First 1 -ExpandProperty DriveLetter")
     letter = result.stdout.strip()
-    if result.returncode != 0 or not letter:
-        raise RuntimeError(result.stderr or "Could not mount ISO.")
-    return f"{letter}:"
+    if result.returncode or not letter:
+        raise RuntimeError(result.stderr or "Could not mount the ISO.")
+    return letter.upper() + ":"
 
 
-def dismount_iso(iso_path):
-    run_command([
-        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-        f"Dismount-DiskImage -ImagePath '{iso_path}'",
-    ])
+def dismount_iso(path):
+    ps(f"Dismount-DiskImage -ImagePath {quote_ps(path)}")
 
 
-def copy_tree(source, target, progress, status):
-    total = 0
-    for root, _, files in os.walk(source):
-        for filename in files:
-            try:
-                total += os.path.getsize(os.path.join(root, filename))
-            except OSError:
-                pass
-
-    copied = 0
-    for root, _, files in os.walk(source):
-        relative = os.path.relpath(root, source)
-        destination_root = target if relative == "." else os.path.join(target, relative)
-        os.makedirs(destination_root, exist_ok=True)
-        for filename in files:
-            src = os.path.join(root, filename)
-            dst = os.path.join(destination_root, filename)
-            with open(src, "rb") as source_file, open(dst, "wb") as target_file:
-                while True:
-                    block = source_file.read(1024 * 1024)
-                    if not block:
-                        break
-                    target_file.write(block)
-                    copied += len(block)
-                    progress(int(copied * 100 / total) if total else 100)
-            status(f"Copying installation files: {copied:,} / {total:,} bytes")
+def image_file(iso_root):
+    sources = Path(iso_root) / "sources"
+    wim = sources / "install.wim"
+    esd = sources / "install.esd"
+    if wim.exists():
+        return wim
+    if esd.exists():
+        return esd
+    return None
 
 
-def create_windows_installer(iso_path, drive, progress, status):
+def copy_files(source, target, exclude, progress, status):
+    source = str(Path(source))
+    target = str(Path(target))
+    # robocopy is substantially safer and faster than Python copying on Windows.
+    args = ["robocopy", source, target, "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:1", "/W:1", "/NP", "/NFL", "/NDL"]
+    for item in exclude:
+        args += ["/XF", item]
+    result = command(args)
+    if result.returncode >= 8:
+        raise RuntimeError(result.stdout or result.stderr or "Robocopy failed.")
+    progress(80)
+    status("ISO files copied. Finalizing installation image...")
+
+
+def split_wim(wim, destination, progress, status):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    status(f"Splitting {wim.name} into FAT32-compatible files...")
+    result = command(["dism.exe", "/English", "/Split-Image", f"/ImageFile:{wim}",
+                      f"/SWMFile:{destination}", "/FileSize:3800"])
+    if result.returncode != 0:
+        raise RuntimeError(result.stdout or result.stderr or "DISM could not split the Windows image.")
+    progress(96)
+
+
+def create_installer(iso, disk, scheme, filesystem, progress, status):
     if platform.system() != "Windows":
-        raise RuntimeError("Windows installer mode is currently supported on Windows only.")
+        raise RuntimeError("This release supports Windows 10/11 only.")
+    iso = os.path.abspath(iso)
+    if not os.path.isfile(iso) or not iso.lower().endswith(".iso"):
+        raise RuntimeError("Select a valid Windows ISO file.")
+    if os.path.getsize(iso) > disk["size"]:
+        raise RuntimeError("The ISO is larger than the USB capacity. Use a larger USB drive.")
 
-    status("Creating GPT/FAT32 installer partition...")
-    usb_letter = create_partitioned_usb(drive["number"])
-    iso_letter = mount_iso(iso_path)
+    iso_drive = None
     try:
-        status("Copying Windows installer files...")
-        copy_tree(iso_letter + "\\", usb_letter + "\\", progress, status)
-        # bootsect is optional and may not be present in PATH.
-        bootsect = os.path.join(iso_letter + "\\", "boot", "bootsect.exe")
-        if os.path.exists(bootsect):
-            run_command([bootsect, "/nt60", usb_letter, "/force", "/mbr"])
+        status(f"Erasing Disk {disk['number']} and creating {scheme}/{filesystem} media...")
+        usb = prepare_disk(disk["number"], scheme, filesystem)
+        progress(10)
+        iso_drive = mount_iso(iso)
+        root = iso_drive + "\\"
+        special = image_file(root)
+        excludes = []
+        if filesystem == "FAT32" and special and special.stat().st_size > MAX_FAT32_FILE:
+            if special.name.lower() != "install.wim":
+                raise RuntimeError("This ISO has an install.esd larger than 4 GB. Choose NTFS or an ISO with install.wim.")
+            excludes = [special.name]
+        status("Copying Windows installation files...")
+        copy_files(root, usb + "\\", excludes, progress, status)
+        if excludes:
+            split_wim(special, Path(usb + "\\sources\\install.swm"), progress, status)
+        # Use bootsect when present; it is not required for UEFI but helps MBR/BIOS media.
+        bootsect = Path(root) / "boot" / "bootsect.exe"
+        if scheme == "MBR" and bootsect.exists():
+            command([str(bootsect), "/nt60", usb, "/force", "/mbr"])
+        command(["cmd.exe", "/c", "sync"])
+        progress(100)
+        status("Installer USB is ready.")
     finally:
-        dismount_iso(iso_path)
-    progress(100)
-    status("Installer USB created successfully.")
+        if iso_drive:
+            dismount_iso(iso)
 
 
 class Signals(QObject):
@@ -187,9 +188,8 @@ class Signals(QObject):
 
 
 class Worker:
-    def __init__(self, iso, drive):
-        self.iso = iso
-        self.drive = drive
+    def __init__(self, iso, disk, scheme, filesystem):
+        self.iso, self.disk, self.scheme, self.filesystem = iso, disk, scheme, filesystem
         self.signals = Signals()
 
     def start(self):
@@ -197,139 +197,117 @@ class Worker:
 
     def run(self):
         try:
-            create_windows_installer(
-                self.iso, self.drive,
-                self.signals.progress.emit,
-                self.signals.status.emit,
-            )
-            self.signals.success.emit("The installer USB is ready. Restart the target PC and boot from USB.")
+            create_installer(self.iso, self.disk, self.scheme, self.filesystem,
+                             self.signals.progress.emit, self.signals.status.emit)
+            self.signals.success.emit("CLINTOY HUB finished successfully. Safely eject the USB before removing it.")
         except Exception as error:
             self.signals.failure.emit(str(error))
 
 
-class MainWindow(QMainWindow):
+class Window(QMainWindow):
     def __init__(self):
         super().__init__()
         self.iso = None
-        self.drives = []
+        self.disk_list = []
         self.worker = None
-        self.setWindowTitle(APP_NAME)
-        self.resize(700, 500)
-        self.build_ui()
+        self.setWindowTitle(APP_NAME + " v2")
+        self.resize(760, 570)
+        self.ui()
         self.refresh()
 
-    def build_ui(self):
+    def ui(self):
         root = QVBoxLayout()
-        title = QLabel(APP_NAME)
+        title = QLabel(APP_NAME + " v2")
         title.setStyleSheet("font-size: 24px; font-weight: bold;")
         root.addWidget(title)
-        root.addWidget(QLabel("Create a partitioned Windows installer USB."))
+        root.addWidget(QLabel("Windows installer media with GPT/MBR and large-WIM handling."))
 
         image_box = QGroupBox("1. Windows ISO")
         image_row = QHBoxLayout(image_box)
-        self.image_field = QLineEdit()
-        self.image_field.setReadOnly(True)
-        browse = QPushButton("Browse")
-        browse.clicked.connect(self.choose_iso)
-        image_row.addWidget(self.image_field)
-        image_row.addWidget(browse)
+        self.image_field = QLineEdit(); self.image_field.setReadOnly(True)
+        browse = QPushButton("Browse"); browse.clicked.connect(self.choose_iso)
+        image_row.addWidget(self.image_field); image_row.addWidget(browse)
         root.addWidget(image_box)
 
         drive_box = QGroupBox("2. Target USB drive")
-        drive_layout = QVBoxLayout(drive_box)
+        drive_row = QVBoxLayout(drive_box)
         self.drive_list = QListWidget()
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh)
-        drive_layout.addWidget(self.drive_list)
-        drive_layout.addWidget(refresh)
+        refresh = QPushButton("Refresh"); refresh.clicked.connect(self.refresh)
+        drive_row.addWidget(self.drive_list); drive_row.addWidget(refresh)
         root.addWidget(drive_box)
 
-        warning = QLabel("WARNING: The selected USB drive will be completely erased.")
-        warning.setStyleSheet("color: #b00020; font-weight: bold;")
-        root.addWidget(warning)
+        options = QGroupBox("3. Boot options")
+        row = QHBoxLayout(options)
+        row.addWidget(QLabel("Partition style:"))
+        self.scheme = QComboBox(); self.scheme.addItems(["GPT (UEFI - Windows 11 recommended)", "MBR (Legacy BIOS + UEFI)"])
+        row.addWidget(self.scheme)
+        row.addWidget(QLabel("Filesystem:"))
+        self.filesystem = QComboBox(); self.filesystem.addItems(["FAT32 (split install.wim)", "NTFS (large files)"])
+        row.addWidget(self.filesystem)
+        root.addWidget(options)
 
-        self.progress = QProgressBar()
-        self.status = QLabel("Ready.")
-        root.addWidget(self.progress)
-        root.addWidget(self.status)
-
+        warning = QLabel("WARNING: The selected USB disk will be completely erased. Verify the disk number and capacity.")
+        warning.setStyleSheet("color:#b00020;font-weight:bold;padding:6px;")
+        warning.setWordWrap(True); root.addWidget(warning)
+        self.progress = QProgressBar(); self.status = QLabel("Ready.")
+        root.addWidget(self.progress); root.addWidget(self.status)
         buttons = QHBoxLayout()
-        self.create_button = QPushButton("Create Install USB")
-        self.create_button.clicked.connect(self.create)
-        close = QPushButton("Close")
-        close.clicked.connect(self.close)
-        buttons.addWidget(self.create_button)
-        buttons.addWidget(close)
-        root.addLayout(buttons)
-
-        container = QWidget()
-        container.setLayout(root)
-        self.setCentralWidget(container)
+        self.create_button = QPushButton("Create Install USB"); self.create_button.clicked.connect(self.create)
+        close = QPushButton("Close"); close.clicked.connect(self.close)
+        buttons.addWidget(self.create_button); buttons.addWidget(close); root.addLayout(buttons)
+        container = QWidget(); container.setLayout(root); self.setCentralWidget(container)
 
     def choose_iso(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Windows ISO", "", "ISO files (*.iso)")
         if path:
-            self.iso = path
-            self.image_field.setText(path)
+            self.iso = path; self.image_field.setText(path)
 
     def refresh(self):
-        self.drive_list.clear()
-        self.drives = detect_drives()
-        for drive in self.drives:
-            self.drive_list.addItem(QListWidgetItem(
-                f"{drive['name']} — {format_bytes(drive['size'])} — Disk {drive['number']}"
-            ))
-        self.create_button.setEnabled(bool(self.drives))
-        self.status.setText(f"Detected {len(self.drives)} USB drive(s).")
-
-    def selected_drive(self):
-        row = self.drive_list.currentRow()
-        return self.drives[row] if 0 <= row < len(self.drives) else None
+        self.drive_list.clear(); self.disk_list = drives()
+        for disk in self.disk_list:
+            self.drive_list.addItem(QListWidgetItem(f"Disk {disk['number']} — {disk['name']} — {human(disk['size'])}"))
+        self.create_button.setEnabled(bool(self.disk_list))
+        self.status.setText(f"Detected {len(self.disk_list)} removable USB drive(s).")
 
     def create(self):
-        drive = self.selected_drive()
-        if not self.iso or not drive:
-            QMessageBox.warning(self, APP_NAME, "Select a Windows ISO and USB drive.")
+        index = self.drive_list.currentRow()
+        disk = self.disk_list[index] if 0 <= index < len(self.disk_list) else None
+        if not self.iso or not disk:
+            QMessageBox.warning(self, APP_NAME, "Select a Windows ISO and a USB drive."); return
+        scheme = "GPT" if self.scheme.currentIndex() == 0 else "MBR"
+        filesystem = "FAT32" if self.filesystem.currentIndex() == 0 else "NTFS"
+        if filesystem == "NTFS" and scheme == "GPT":
+            text = "GPT/NTFS may not boot on every UEFI computer. FAT32 is recommended for maximum compatibility. Continue?"
+            if QMessageBox.warning(self, APP_NAME, text, QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+                return
+        confirmation = (f"ERASE DISK {disk['number']}?\n\n{disk['name']}\n{human(disk['size'])}\n\n"
+                        f"Mode: {scheme} + {filesystem}\n\nAll data will be permanently deleted.")
+        if QMessageBox.warning(self, APP_NAME, confirmation, QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
-        answer = QMessageBox.warning(
-            self, APP_NAME,
-            f"ERASE DISK {drive['number']} ({drive['name']}, {format_bytes(drive['size'])})?\n\nAll data will be lost.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            return
-        self.create_button.setEnabled(False)
-        self.progress.setValue(0)
-        self.worker = Worker(self.iso, drive)
+        self.create_button.setEnabled(False); self.progress.setValue(0)
+        self.worker = Worker(self.iso, disk, scheme, filesystem)
         self.worker.signals.progress.connect(self.progress.setValue)
         self.worker.signals.status.connect(self.status.setText)
-        self.worker.signals.success.connect(self.success)
-        self.worker.signals.failure.connect(self.failure)
+        self.worker.signals.success.connect(self.done)
+        self.worker.signals.failure.connect(self.failed)
         self.worker.start()
 
-    def success(self, message):
-        self.create_button.setEnabled(True)
-        QMessageBox.information(self, APP_NAME, message)
-        self.refresh()
+    def done(self, message):
+        self.create_button.setEnabled(True); self.status.setText("Completed.")
+        QMessageBox.information(self, APP_NAME, message); self.refresh()
 
-    def failure(self, message):
-        self.create_button.setEnabled(True)
+    def failed(self, message):
+        self.create_button.setEnabled(True); self.status.setText("Failed.")
         QMessageBox.critical(self, APP_NAME, "Creation failed:\n\n" + message)
 
 
 def main():
     if platform.system() != "Windows":
-        print("This Windows installer mode must run on Windows.")
-        return
-    if not is_admin():
+        print("CLINTOY HUB v2 requires Windows 10 or Windows 11."); return
+    if not admin():
         import ctypes
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{os.path.abspath(sys.argv[0])}"', None, 1)
-        return
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{os.path.abspath(sys.argv[0])}"', None, 1); return
+    app = QApplication(sys.argv); window = Window(); window.show(); sys.exit(app.exec())
 
 
 if __name__ == "__main__":
