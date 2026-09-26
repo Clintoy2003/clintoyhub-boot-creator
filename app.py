@@ -1,26 +1,19 @@
 import json
 import os
 import platform
-import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
-from urllib.request import urlopen
 
-from PySide6.QtCore import QObject, Signal, Qt
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QProgressBar, QVBoxLayout, QWidget, QTabWidget, QSpinBox,
-    QCheckBox, QTextEdit
+    QPushButton, QProgressBar, QVBoxLayout, QWidget,
 )
 
 APP_NAME = "CLINTOY HUB Boot Creator"
-APP_VERSION = "v4 - Ventoy Edition"
-VENTOY_VERSION = "1.0.17"
-VENTOY_URL = f"https://github.com/ventoy/Ventoy/releases/download/v{VENTOY_VERSION}/ventoy-{VENTOY_VERSION}-windows.zip"
 MAX_FAT32_FILE = 4 * 1024**3
 MIN_EXTRA_BYTES = 512 * 1024 * 1024
 
@@ -180,7 +173,7 @@ def split_wim(source, destination, progress, status):
 
 def create_installer(iso, disk, scheme, filesystem, progress, status):
     if platform.system() != "Windows":
-        raise RuntimeError("CLINTOY HUB v4 requires Windows 10 or Windows 11.")
+        raise RuntimeError("CLINTOY HUB requires Windows 10 or Windows 11.")
     iso = os.path.abspath(iso)
     if not os.path.isfile(iso) or not iso.lower().endswith(".iso"):
         raise RuntimeError("Select a valid Windows ISO file.")
@@ -250,7 +243,7 @@ class Window(QMainWindow):
         self.iso = None
         self.disk_list = []
         self.worker = None
-        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+        self.setWindowTitle(APP_NAME + " v3")
         self.resize(820, 620)
         self.build_ui()
         self.refresh()
@@ -259,7 +252,7 @@ class Window(QMainWindow):
         root = QVBoxLayout()
         title = QLabel("CLINTOY HUB")
         title.setObjectName("title")
-        subtitle = QLabel("Boot Creator  •  Ventoy Multi-Boot Edition")
+        subtitle = QLabel("Boot Creator  • Verified Windows installer media")
         subtitle.setObjectName("subtitle")
         root.addWidget(title)
         root.addWidget(subtitle)
@@ -281,14 +274,14 @@ class Window(QMainWindow):
         options = QGroupBox("03  Boot configuration")
         row = QHBoxLayout(options)
         row.addWidget(QLabel("Partition style"))
-        self.scheme = QComboBox(); self.scheme.addItems(["GPT  •  UEFI (recommended for Windows 11)", "MBR  •  Legacy BIOS + UEFI"])
+        self.scheme = QComboBox(); self.scheme.addItems(["GPT  • UEFI (recommended for Windows 11)", "MBR  • Legacy BIOS + UEFI"])
         row.addWidget(self.scheme)
         row.addWidget(QLabel("Filesystem"))
-        self.filesystem = QComboBox(); self.filesystem.addItems(["FAT32  •  split large WIM automatically", "NTFS  •  large files"])
+        self.filesystem = QComboBox(); self.filesystem.addItems(["FAT32  • split large WIM automatically", "NTFS  • large files"])
         row.addWidget(self.filesystem)
         root.addWidget(options)
 
-        warning = QLabel("CAUTION  •  The selected physical USB disk will be erased completely. Confirm its disk number and capacity before continuing.")
+        warning = QLabel("CAUTION  • The selected physical USB disk will be erased completely. Confirm its disk number and capacity before continuing.")
         warning.setObjectName("warning"); warning.setWordWrap(True); root.addWidget(warning)
         self.progress = QProgressBar(); self.progress.setTextVisible(True)
         self.status = QLabel("Ready. Select an ISO and a removable USB drive.")
@@ -308,7 +301,7 @@ class Window(QMainWindow):
     def refresh(self):
         self.drive_list.clear(); self.disk_list = usb_disks()
         for disk in self.disk_list:
-            self.drive_list.addItem(QListWidgetItem(f"Disk {disk['number']}   •   {disk['name']}   •   {human(disk['size'])}"))
+            self.drive_list.addItem(QListWidgetItem(f"Disk {disk['number']}   • {disk['name']}   • {human(disk['size'])}"))
         self.create_button.setEnabled(bool(self.disk_list))
         self.status.setText(f"Detected {len(self.disk_list)} removable USB drive(s).")
 
@@ -338,7 +331,7 @@ class Window(QMainWindow):
 
 def main():
     if platform.system() != "Windows":
-        print("CLINTOY HUB v4 requires Windows 10 or Windows 11."); return
+        print("CLINTOY HUB requires Windows 10 or Windows 11."); return
     if not admin():
         import ctypes
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{os.path.abspath(sys.argv[0])}"', None, 1); return
