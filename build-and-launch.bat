@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 
-title CLINTOY HUB Boot Creator v4 - Ventoy Edition Builder
+title CLINTOY HUB Boot Creator v4 - Builder
 
 echo ==========================================
 echo   CLINTOY HUB Boot Creator v4
@@ -63,7 +63,7 @@ if not exist "assets\logo.svg" (
 )
 
 echo.
-echo Building CLINTOY HUB Boot Creator v4 - Ventoy Edition...
+echo Building CLINTOY HUB Boot Creator v4...
 
 python -m PyInstaller --noconfirm --clean --onefile --windowed --add-data "assets;assets" --name "CLINTOY-HUB-Boot-Creator-v4" app.py
 
